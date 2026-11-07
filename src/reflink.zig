@@ -156,7 +156,7 @@ io: Io,
 
 const testing = std.testing;
 
-test "root: copy on write" {
+test "reflink: copy on write" {
     const io = testing.io;
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
