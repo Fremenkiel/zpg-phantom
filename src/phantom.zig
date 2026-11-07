@@ -1,9 +1,13 @@
+const builtin = @import("builtin");
+const native_os = builtin.os.tag;
+const is_darwin = native_os.isDarwin();
+const is_linux = native_os == .linux;
+
 const std = @import("std");
 const Io = std.Io;
+const fmt = std.fmt;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const builtin = @import("builtin");
-
 const assert = std.debug.assert;
 
 const conn = @import("connection.zig");
@@ -21,27 +25,26 @@ CreateDirError,
 UnexpectedError
 } || Allocator.Error;
 
-const Config = struct {
-    template_file_path: []const u8,
-    temp_dir_path: []const u8,
-    in_memory: bool,
-};
-
 pub const Phantom = struct {
     allocator: Allocator,
     io: Io,
 
-    config: Config,
-    os_tag: std.Target.Os.Tag,
+    source_file_path: []const u8,
+    dest_path: []const u8,
 
     connections: std.hash_map.HashMap(i96, *Connection, std.hash_map.AutoContext(i96), 80),
 
     /// Creates sub dirs for data and sockets, main temperary dir must exist.
-    pub fn init(allocator: Allocator, io: Io, config: Config) PhantomError!@This() {
-        assert(config.template_file_path.len > 0);
-        assert(config.temp_dir_path.len > 0);
+    pub fn init(allocator: Allocator, io: Io, source_file_path: []const u8, dest_path: []const u8) PhantomError!@This() {
+        assert(source_file_path.len > 0);
+        assert(dest_path.len > 0);
 
-        var file = Io.Dir.openFile(Io.Dir.cwd(), io, config.template_file_path, .{
+        if (!is_darwin and !is_linux) {
+            return PhantomError.UnsupportedSystem;
+        }
+
+        var cwd = Io.Dir.cwd();
+        var file = cwd.openFile(io, source_file_path, .{
             .mode = .read_only
         }) catch |err| return switch (err) {
             Io.Dir.OpenError.FileNotFound => PhantomError.TemplateFileNotFound,
@@ -49,25 +52,20 @@ pub const Phantom = struct {
         };
         defer file.close(io);
 
-        const data_dir_path = std.fmt.allocPrint(allocator, "{s}/data", .{ config.temp_dir_path }) catch { return PhantomError.OutOfMemory; };
-        defer allocator.free(data_dir_path);
+        var dir = cwd.openDir(io, dest_path, .{}) catch |err| return switch (err) {
+            Io.Dir.OpenError.FileNotFound => PhantomError.TemplateFileNotFound,
+            else => PhantomError.UnexpectedError,
+        };
+        defer dir.close(io);
 
-        try createDir(Io.Dir.cwd(), io, data_dir_path);
-
-        const socket_dir_path = std.fmt.allocPrint(allocator, "{s}/socket", .{ config.temp_dir_path }) catch { return PhantomError.OutOfMemory; };
-        defer allocator.free(socket_dir_path);
-
-        try createDir(Io.Dir.cwd(), io, socket_dir_path);
+        try createDir(dir, io, "data");
+        try createDir(dir, io, "socket");
 
         const phantom = Phantom{
             .allocator = allocator,
             .io = io,
-            .config = config,
-            .os_tag = switch (builtin.os.tag) {
-                .macos => .macos,
-                .linux => .linux,
-                else => return PhantomError.UnsupportedSystem
-            },
+            .source_file_path = source_file_path,
+            .dest_path = dest_path,
             .connections = .init(allocator)
         };
 
@@ -85,17 +83,19 @@ pub const Phantom = struct {
         self.connections.deinit();
     }
 
-    pub fn setup(self: *@This()) !i96 {
-        var connection = Connection.init(self.allocator, self.io, .{
-            .template_file = self.config.template_file_path,
-            .temp_dir = self.config.temp_dir_path,
-            .os_tag = self.os_tag,
-        });
+    pub fn createDatabase(self: *@This()) !i96 {
+        var connection = try Connection.init(
+            self.allocator,
+            self.io,
+            self.source_file_path,
+            self.dest_path);
 
         try self.connections.put(connection.id, &connection);
+
+        return connection.id;
     }
 
-    pub fn spawn(self: *@This(), id: i96) !i96 {
+    pub fn spawnChildProcess(self: *@This(), id: i96) !i96 {
         var connection = self.connections.get(id);
 
         if (connection == null) {
@@ -106,12 +106,10 @@ pub const Phantom = struct {
             return PhantomError.ConnectionAlreadyRunning;
         }
 
-        const socket_path = try &connection.?.boot();
-        
-        return socket_path;
+        return try &connection.?.spawnProcess();
     }
 
-    pub fn term(self: *@This(), id: i96) !std.process.Child.Term {
+    pub fn termChildProcess(self: *@This(), id: i96) !std.process.Child.Term {
         var connection = self.connections.get(id);
 
         if (connection == null) {
@@ -122,10 +120,10 @@ pub const Phantom = struct {
             return PhantomError.ConnectionAlreadyRunning;
         }
 
-        return try connection.?.kill(.TERM);
+        return try connection.?.killProcess(.TERM);
     }
 
-    pub fn kill(self: *@This(), id: i96) !std.process.Child.Term {
+    pub fn killChildProcess(self: *@This(), id: i96) !std.process.Child.Term {
         var connection = self.connections.get(id);
 
         if (connection == null) {
@@ -136,11 +134,11 @@ pub const Phantom = struct {
             return PhantomError.ConnectionAlreadyRunning;
         }
 
-        return try connection.?.kill(.KILL);
+        return try connection.?.killProcess(.KILL);
     }
 
     fn createDir(dir: Io.Dir, io: Io, sub_path: []const u8) PhantomError!void {
-        Io.Dir.createDir(dir, io, sub_path, Io.File.Permissions.default_dir) catch |err| switch (err) {
+        dir.createDir(io, sub_path, Io.File.Permissions.default_dir) catch |err| switch (err) {
             Io.Dir.CreateDirError.AccessDenied => return PhantomError.PermissionDenied,
             Io.Dir.CreateDirError.PermissionDenied => return PhantomError.PermissionDenied,
             Io.Dir.CreateDirError.PathAlreadyExists => {},
@@ -154,85 +152,52 @@ pub const Phantom = struct {
 const testing = std.testing;
 
 test "phantom: init" {
-    const gpa = testing.allocator;
+    const allocator = testing.allocator;
     const io = testing.io;
 
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var phantom = try Phantom.init(gpa, io, .{
-        .template_file = "./test",
-        .temp_dir = tmp_dir,
-        .in_memory = false,
-    });
+    const dest_path = try fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    defer allocator.free(dest_path);
+
+    var phantom = try Phantom.init(allocator, io, "./test/template.db", dest_path);
     defer phantom.deinit();
 
-    var dir = try Io.Dir.openDir(Io.Dir.cwd(), io, tmp_dir, .{});
-    defer dir.close(io);
-
-    var data_dir = try dir.openDir(io, "data", .{});
+    var data_dir = try tmp_dir.dir.openDir(io, "data", .{});
     defer data_dir.close(io);
 
-    var socket_dir = try dir.openDir(io, "socket", .{});
+    var socket_dir = try tmp_dir.dir.openDir(io, "socket", .{});
     defer socket_dir.close(io);
 }
 
-test "phantom: from cwd" {
-    const gpa = testing.allocator;
-    const io = testing.io;
-
-    const temp_dir = "./phantom";
-
-    var phantom = try Phantom.init(gpa, io, .{
-        .template_file_path = "./test",
-        .temp_dir_path = temp_dir,
-        .in_memory = false,
-    });
-    defer phantom.deinit();
-
-    var dir = try Io.Dir.openDir(Io.Dir.cwd(), io, temp_dir, .{});
-    defer dir.close(io);
-
-    var data_dir = try dir.openDir(io, "data", .{});
-    defer data_dir.close(io);
-
-    var socket_dir = try dir.openDir(io, "socket", .{});
-    defer socket_dir.close(io);
-}
-
-test "phantom: no template_file" {
-}
-
-test "phantom: no temp_dir" {
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
-}
+// test "fuzz example" {
+//     try std.testing.fuzz({}, testOne, .{});
+// }
+//
+// fn testOne(context: void, smith: *std.testing.Smith) !void {
+//     _ = context;
+//     // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
+//
+//     const gpa = std.testing.allocator;
+//     var list: std.ArrayList(u8) = .empty;
+//     defer list.deinit(gpa);
+//     while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
+//         .add_data => {
+//             const slice = try list.addManyAsSlice(gpa, smith.value(u4));
+//             smith.bytes(slice);
+//         },
+//         .dup_data => {
+//             if (list.items.len == 0) continue;
+//             if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
+//             const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
+//             const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
+//             try list.appendSlice(gpa, list.items[off..][0..len]);
+//             try std.testing.expectEqualSlices(
+//                 u8,
+//                 list.items[off..][0..len],
+//                 list.items[list.items.len - len ..],
+//             );
+//         },
+//     };
+// }

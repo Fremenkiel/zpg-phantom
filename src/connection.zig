@@ -1,7 +1,10 @@
 const std = @import("std");
 const Io = std.Io;
+const Dir = Io.Dir;
 const mem = std.mem;
 const Allocator = mem.Allocator;
+
+const reflink = @import("reflink.zig");
 
 pub const ConnectionError = error{
 ProcessNotStartedError,
@@ -28,12 +31,6 @@ const Status = enum(u8) {
     FAILED
 };
 
-const Config = struct {
-    template_file_path: []const u8,
-    tmp_dir_path: []const u8,
-    os_tag: std.Target.Os.Tag,
-};
-
 pub const Connection = struct {
     allocator: Allocator,
     io: Io,
@@ -47,29 +44,26 @@ pub const Connection = struct {
 
     process: *std.process.Child,
 
-    pub fn init(allocator: Allocator, io: Io, config: Config) ConnectionError!@This() {
+    pub fn init(allocator: Allocator, io: Io, source_path: []const u8, dest_dir: Dir) ConnectionError!@This() {
         const id = Io.Clock.real.now(io).toNanoseconds();
 
         const connection = Connection{
             .allocator = allocator,
             .io = io,
             .id = id,
-            .data_path = std.fmt.allocPrint(allocator, "{s}/data/data_{d}", .{ config.temp_dir, id }),
-            .socket_path = std.fmt.allocPrint(allocator, "{s}/socket/sock_{d}", .{ config.temp_dir, id }),
+            .data_path = std.fmt.allocPrint(allocator, "data/data_{d}", .{ id }),
+            .socket_path = std.fmt.allocPrint(allocator, "socket/sock_{d}", .{ id }),
             .status = .INITIALIZED,
         };
 
-        switch (config.os_tag) {
-            .macos => std.fmt.allocPrint(connection.allocator, "cp -a -c {s} {s}", .{ config.template_file, connection.data_path }) catch { return ConnectionError.OutOfMemory; },
-            .linux => std.fmt.allocPrint(connection.allocator, "cp --reflink=always {s} {s}", .{ config.template_file, connection.data_path }) catch { return ConnectionError.OutOfMemory; },
-        }
+        reflink.copyOnWrite(Io.Dir.cwd(), source_path, dest_dir, connection.data_path, io, .{});
 
         return connection;
     }
 
     pub fn deinit(self: *@This()) void {
         if (self.status == .RUNNING) {
-            _ = self.kill(.KILL) catch |err| {
+            _ = self.killProcess(.KILL) catch |err| {
                 // Assuming process is already killed
                 if (err == KillError.ProcessNotFound) {
                     self.status = .STOPPED;
@@ -88,7 +82,7 @@ pub const Connection = struct {
         self.allocator.free(self.socket_path);
     }
 
-    pub fn boot(self: *@This()) SpawnError![]const u8 {
+    pub fn spawnProcess(self: *@This()) SpawnError![]const u8 {
         const argv = &[_][]const u8{
             "postgres",
             "-D",
@@ -112,7 +106,7 @@ pub const Connection = struct {
         return self.socket_path;
     }
 
-    pub fn kill(self: *@This(), sig: std.posix.SIG) KillError!std.process.Child.Term {
+    pub fn killProcess(self: *@This(), sig: std.posix.SIG) KillError!std.process.Child.Term {
         if (self.process.id) |pid| {
             std.posix.kill(pid, sig) catch |err| return switch (err) {
                 std.posix.KillError.PermissionDenied => KillError.PermissionDenied,
