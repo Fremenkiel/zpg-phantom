@@ -27,10 +27,6 @@ SockCreateError,
 UnexpectedError
 } || Allocator.Error;
 
-pub const SpawnError = error{
-UnexpectedError,
-} || process.SpawnError || Io.ConcurrentError;
-
 pub const KillError = error{
 ProcessNotFound,
 ProcessNotRunning,
@@ -39,6 +35,18 @@ AccessDenied,
 Canceled,
 UnexpectedError,
 };
+
+pub const CheckHealthError = error{
+PostgresExitedUnexpectedly,
+PostgresCrashed,
+PostgresAbnormalTermination
+} || process.Child.WaitError;
+
+pub const WaitUntilReadyError = CheckHealthError || Io.Cancelable;
+
+pub const SpawnError = error{
+UnexpectedError,
+} || process.SpawnError || Io.ConcurrentError || WaitUntilReadyError;
 
 const Status = enum(u8) {
     Initialized,
@@ -52,7 +60,6 @@ const random_bytes_count = 12;
 const sub_path_len = std.base64.url_safe.Encoder.calcSize(random_bytes_count);
 
 const pg_ready_str = "database system is ready to accept connections";
-const pg_shutdown_str = "database system is shut down";
 
 pub const Phantom = struct {
     allocator: Allocator,
@@ -62,7 +69,6 @@ pub const Phantom = struct {
     mutex: Io.Mutex = .init,
 
     ready_event: Io.Event = .unset,
-    shutdown_event: Io.Event = .unset,
     exited_event: Io.Event = .unset,
 
     sub_dir: fs.TmpDir,
@@ -71,7 +77,7 @@ pub const Phantom = struct {
 
     status: Status,
     term_result: ?process.Child.Term = null,
-    wait_err: ?anyerror = null,
+    wait_err: ?process.Child.WaitError = null,
 
     stderr_future: ?Io.Future(void) = null,
     monitor_future: ?Io.Future(void) = null,
@@ -116,9 +122,18 @@ pub const Phantom = struct {
         };
     }
 
+    fn createSubPath(io: Io, dir: Dir) Dir.CreateDirPathOpenError!Dir {
+        var random_bytes: [random_bytes_count]u8 = undefined;
+        io.random(&random_bytes);
+        var sub_path: [sub_path_len]u8 = undefined;
+        _ = std.base64.url_safe.Encoder.encode(&sub_path, &random_bytes);
+
+        return try dir.createDirPathOpen(io, &sub_path, .{ .open_options = .{} });
+    }
+
     pub fn deinit(self: *@This()) void {
         if (self.status == .Running) {
-            self.killProcess(.KILL) catch |err| {
+            self.kill(.KILL) catch |err| {
                 // Assuming process is already killed
                 if (err == KillError.ProcessNotFound) {
                     self.status = .Stopped;
@@ -139,7 +154,7 @@ pub const Phantom = struct {
         self.sub_dir.cleanup(self.io);
     }
 
-    pub fn spawnProcess(self: *@This()) SpawnError![]const u8 {
+    pub fn spawn(self: *@This()) SpawnError!void {
         const argv = &[_][]const u8{ "postgres", "-D", self.data_path, "-k", "./sock", "-c", "listen_addresses=", };
 
         self.child = try process.spawn(self.io, .{
@@ -152,13 +167,12 @@ pub const Phantom = struct {
         self.exited_event = .unset;
 
         self.ready_event.reset();
-        self.shutdown_event.reset();
         self.exited_event.reset();
 
         self.stderr_future = try self.io.concurrent(drainStderr, .{self});
         self.monitor_future = try self.io.concurrent(monitorLoop, .{self});
 
-        return self.socket_path;
+        try self.waitUntilReady();
     }
 
     fn drainStderr(self: *@This()) void {
@@ -184,12 +198,6 @@ pub const Phantom = struct {
                     self.ready_event.set(self.io);
                 }
             }
-
-            if (!self.shutdown_event.isSet()) {
-                if (std.mem.indexOf(u8, line, pg_shutdown_str) != null) {
-                    self.shutdown_event.set(self.io);
-                }
-            }
         }
     }
 
@@ -209,22 +217,15 @@ pub const Phantom = struct {
 
         self.exited_event.set(self.io);
         self.ready_event.set(self.io);
-        self.shutdown_event.set(self.io);
     }
 
-    pub fn waitUntilReady(self: *@This()) !void {
+    fn waitUntilReady(self: *@This()) WaitUntilReadyError!void {
         try self.ready_event.wait(self.io);
 
         try self.checkHealth();
     }
 
-    pub fn waitUntilShutdown(self: *@This()) !void {
-        try self.shutdown_event.wait(self.io);
-
-        try self.checkHealth();
-    }
-
-    pub fn checkHealth(self: *@This()) !void {
+    pub fn checkHealth(self: *@This()) CheckHealthError!void {
         if (!self.exited_event.isSet()) return;
 
         try self.mutex.lock(self.io);
@@ -248,7 +249,7 @@ pub const Phantom = struct {
         }
     }
 
-    pub fn killProcess(self: *@This(), sig: posix.SIG) KillError!void {
+    pub fn kill(self: *@This(), sig: posix.SIG) KillError!void {
         self.mutex.lockUncancelable(self.io);
 
         if (self.child.id == null) {
@@ -275,18 +276,6 @@ pub const Phantom = struct {
         }
     }
 
-    pub fn getPid(self: *@This()) ?process.Child.Id {
-        return self.child.id;
-    }
-
-    fn createSubPath(io: Io, dir: Dir) !Dir {
-        var random_bytes: [random_bytes_count]u8 = undefined;
-        io.random(&random_bytes);
-        var sub_path: [sub_path_len]u8 = undefined;
-        _ = std.base64.url_safe.Encoder.encode(&sub_path, &random_bytes);
-
-        return try dir.createDirPathOpen(io, &sub_path, .{ .open_options = .{} });
-    }
 };
 
 const testing = std.testing;
@@ -323,10 +312,9 @@ test "phantom: spawn" {
     var phantom = try Phantom.init(allocator, io, "./test/template.db", dest_path);
     defer phantom.deinit();
 
-    _ = try phantom.spawnProcess();
-    try phantom.waitUntilReady();
+    try phantom.spawn();
 
-    try phantom.killProcess(.TERM);
+    try phantom.kill(.TERM);
 }
 
 // test "fuzz example" {

@@ -10,12 +10,11 @@ pub fn run(allocator: Allocator, io: Io) !void {
     defer database.deinit();
 
     {
-        const socket_path = try database.spawnProcess();
-        try database.waitUntilReady();
+        try database.spawn();
 
         var pg_argv = [_][]const u8{
             "psql",
-            "-h", socket_path,
+            "-h", database.socket_path,
             "-U", "postgres",
             "-q", "-t", "-A", // Formatting
             "-c", "CREATE TABLE users(id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name VARCHAR(255) NOT NULL);",
@@ -34,15 +33,14 @@ pub fn run(allocator: Allocator, io: Io) !void {
         }
     }
 
-    try database.killProcess(.TERM);
+    try database.kill(.TERM);
 
     {
-        const socket_path = try database.spawnProcess();
-        try database.waitUntilReady();
+        try database.spawn();
 
         var pg_argv = [_][]const u8{
             "psql",
-            "-h", socket_path,
+            "-h", database.socket_path,
             "-U", "postgres",
             "-q", "-t", "-A", // Formatting
             "-c", "INSERT INTO users (name) VALUES ('kevin');",
