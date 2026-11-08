@@ -1,0 +1,2 @@
+- better error handling and Error structs
+- general flow cleanup

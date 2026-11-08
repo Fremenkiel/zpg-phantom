@@ -22,11 +22,19 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{
         .root_module = lib.root_module,
     });
+    const run_lib_tests = b.addRunArtifact(lib_tests);
 
-    // Create a run step for the tests
-    const run_tests = b.addRunArtifact(lib_tests);
+    const example_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("example.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    example_tests.root_module.addImport("phantom", mod);
+    const run_example_tests = b.addRunArtifact(example_tests);
 
-    // Attach it to the `zig build test` command
     const test_step = b.step("test", "Run library tests");
-    test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_lib_tests.step);
+    test_step.dependOn(&run_example_tests.step);
 }

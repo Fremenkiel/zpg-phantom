@@ -1,5 +1,14 @@
 
 # Usage
+```zig
+var database = try Phantom.init(allocator, io, "./test/template.db", "/tmp");
+defer database.deinit();
+
+// Socket to be used as host
+// i.e. psql -h {host} -U postgres
+const host = try database.spawnProcess();
+try database.waitUntilReady();
+```
 
 # Create db
 

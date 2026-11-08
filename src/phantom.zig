@@ -9,6 +9,8 @@ const Dir = Io.Dir;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const fmt = std.fmt;
+const Thread = std.Thread;
+const posix = std.posix;
 const process = std.process;
 const assert = std.debug.assert;
 
@@ -26,9 +28,8 @@ UnexpectedError
 } || Allocator.Error;
 
 pub const SpawnError = error{
-Unable,
 UnexpectedError,
-} || process.SpawnError;
+} || process.SpawnError || Io.ConcurrentError;
 
 pub const KillError = error{
 ProcessNotFound,
@@ -40,26 +41,40 @@ UnexpectedError,
 };
 
 const Status = enum(u8) {
-    INITIALIZED,
-    RUNNING,
-    STOPPED,
-    FAILED
+    Initialized,
+    Running,
+    Stopped,
+    Terminated,
+    Failed
 };
 
 const random_bytes_count = 12;
 const sub_path_len = std.base64.url_safe.Encoder.calcSize(random_bytes_count);
 
+const pg_ready_str = "database system is ready to accept connections";
+const pg_shutdown_str = "database system is shut down";
+
 pub const Phantom = struct {
     allocator: Allocator,
+    io: Io,
+
+    child: process.Child,
+    mutex: Io.Mutex = .init,
+
+    ready_event: Io.Event = .unset,
+    shutdown_event: Io.Event = .unset,
+    exited_event: Io.Event = .unset,
 
     sub_dir: fs.TmpDir,
-
     data_path: []const u8,
     socket_path: []const u8,
 
     status: Status,
+    term_result: ?process.Child.Term = null,
+    wait_err: ?anyerror = null,
 
-    child: *process.Child,
+    stderr_future: ?Io.Future(void) = null,
+    monitor_future: ?Io.Future(void) = null,
 
     /// Creates sub dirs for data and sockets, main temperary dir must exist.
     pub fn init(allocator: Allocator, io: Io, source_path: []const u8, dest_path: []const u8) PhantomError!@This() {
@@ -80,30 +95,33 @@ pub const Phantom = struct {
         file.close(io);
 
         const sub_dir = fs.tmpDir(io, dest_path) catch { return PhantomError.CreateDirError; };
-
-        const data_path = try std.fmt.allocPrint(allocator, "{s}/data", .{ sub_dir.sub_path });
-        const socket_path = try std.fmt.allocPrint(allocator, "{s}/sock", .{ sub_dir.sub_path });
-
         reflink.copyOnWrite(cwd, source_path, sub_dir.dir, "data", io, .{}) catch { return PhantomError.FileCopyError; };
-        var sock_file = sub_dir.dir.createFile(io, "sock", .{ .truncate = true }) catch { return PhantomError.SockCreateError; };
-        sock_file.close(io);
+
+        const data_path = try std.fmt.allocPrint(allocator, "{s}/{s}/data", .{ dest_path, sub_dir.sub_path });
+        errdefer allocator.free(data_path);
+
+        const socket_path = try std.fmt.allocPrint(allocator, "{s}/sock", .{ data_path });
+        errdefer allocator.free(socket_path);
+
+        sub_dir.dir.createDir(io, "data/sock", .default_dir ) catch return PhantomError.SockCreateError;
 
         return Phantom{
             .allocator = allocator,
+            .io = io,
             .sub_dir = sub_dir,
             .data_path = data_path,
             .socket_path = socket_path,
-            .status = .INITIALIZED,
+            .status = .Initialized,
             .child = undefined,
         };
     }
 
-    pub fn deinit(self: *@This(), io: Io) void {
-        if (self.status == .RUNNING) {
-            _ = self.killProcess(io, .KILL) catch |err| {
+    pub fn deinit(self: *@This()) void {
+        if (self.status == .Running) {
+            self.killProcess(.KILL) catch |err| {
                 // Assuming process is already killed
                 if (err == KillError.ProcessNotFound) {
-                    self.status = .STOPPED;
+                    self.status = .Stopped;
                     return;
                 }
 
@@ -118,57 +136,143 @@ pub const Phantom = struct {
         self.allocator.free(self.data_path);
         self.allocator.free(self.socket_path);
 
-        self.sub_dir.cleanup(io);
+        self.sub_dir.cleanup(self.io);
     }
 
-    pub fn spawnProcess(self: *@This(), io: Io) SpawnError![]const u8 {
-        const argv = &[_][]const u8{
-            "postgres",
-            "-D",
-            self.data_path,
-            "-c",
-            "unix_socket_directories=",
-            self.socket_path,
-            "-c",
-            "listen_addresses=\"\"",
-        };
+    pub fn spawnProcess(self: *@This()) SpawnError![]const u8 {
+        const argv = &[_][]const u8{ "postgres", "-D", self.data_path, "-k", "./sock", "-c", "listen_addresses=", };
 
-        var child = try process.spawn(io, .{
+        self.child = try process.spawn(self.io, .{
             .argv = argv,
-            .stdout = .pipe,
+            .stdout = .inherit,
             .stderr = .pipe,
         });
 
-        self.child = &child;
-        self.status = .RUNNING;
+        self.status = .Running;
+        self.exited_event = .unset;
+
+        self.ready_event.reset();
+        self.shutdown_event.reset();
+        self.exited_event.reset();
+
+        self.stderr_future = try self.io.concurrent(drainStderr, .{self});
+        self.monitor_future = try self.io.concurrent(monitorLoop, .{self});
 
         return self.socket_path;
     }
 
-    pub fn killProcess(self: *@This(), io: Io, sig: std.posix.SIG) KillError!process.Child.Term {
-        if (self.child.id) |pid| {
-            std.posix.kill(pid, sig) catch |err| return switch (err) {
-                std.posix.KillError.PermissionDenied => KillError.PermissionDenied,
-                std.posix.KillError.ProcessNotFound => KillError.ProcessNotFound,
-                else => KillError.UnexpectedError,
+    fn drainStderr(self: *@This()) void {
+        var buffer: [1024]u8 = undefined;
+        var reader = self.child.stderr.?.reader(self.io, &buffer);
+        var r = &reader.interface;
+
+        while (true) {
+            const maybe_line = r.takeDelimiter('\n') catch |err| switch (err) {
+                error.StreamTooLong => {
+                    _ = r.discardDelimiterInclusive('\n') catch break;
+                    continue;
+                },
+                else => break,
             };
-        } else {
+
+            const line = maybe_line orelse break;
+
+            std.log.debug("[pg] {s}", .{line});
+
+            if (!self.ready_event.isSet()) {
+                if (std.mem.indexOf(u8, line, pg_ready_str) != null) {
+                    self.ready_event.set(self.io);
+                }
+            }
+
+            if (!self.shutdown_event.isSet()) {
+                if (std.mem.indexOf(u8, line, pg_shutdown_str) != null) {
+                    self.shutdown_event.set(self.io);
+                }
+            }
+        }
+    }
+
+    fn monitorLoop(self: *@This()) void {
+        const term_or_err = self.child.wait(self.io);
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (term_or_err) |term| {
+            self.status = .Terminated;
+            self.term_result = term;
+        } else |err| {
+            self.status = .Failed;
+            self.wait_err = err;
+        }
+
+        self.exited_event.set(self.io);
+        self.ready_event.set(self.io);
+        self.shutdown_event.set(self.io);
+    }
+
+    pub fn waitUntilReady(self: *@This()) !void {
+        try self.ready_event.wait(self.io);
+
+        try self.checkHealth();
+    }
+
+    pub fn waitUntilShutdown(self: *@This()) !void {
+        try self.shutdown_event.wait(self.io);
+
+        try self.checkHealth();
+    }
+
+    pub fn checkHealth(self: *@This()) !void {
+        if (!self.exited_event.isSet()) return;
+
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.status == .Stopped) return;
+        if (self.wait_err) |err| return err;
+
+        if (self.term_result) |term| {
+            switch (term) {
+                .exited => |code| {
+                    std.log.err("Postgres exited unexpectedly with code {d}", .{code});
+                    return error.PostgresExitedUnexpectedly;
+                },
+                .signal => |sig| {
+                    std.log.err("Postgres crashed with signal {d}", .{sig});
+                    return error.PostgresCrashed;
+                },
+                else => return error.PostgresAbnormalTermination,
+            }
+        }
+    }
+
+    pub fn killProcess(self: *@This(), sig: posix.SIG) KillError!void {
+        self.mutex.lockUncancelable(self.io);
+
+        if (self.child.id == null) {
             return KillError.ProcessNotRunning;
         }
 
-        const term = self.child.wait(io) catch |err| {
-            self.status = .FAILED;
-
-            return switch (err) {
-                process.Child.WaitError.AccessDenied => KillError.AccessDenied,
-                process.Child.WaitError.Canceled => KillError.Canceled,
+        if (self.status == .Running)  {
+            posix.kill(self.child.id.?, sig) catch |err| return switch (err) {
+                posix.KillError.PermissionDenied => KillError.PermissionDenied,
+                posix.KillError.ProcessNotFound => KillError.ProcessNotFound,
                 else => KillError.UnexpectedError,
             };
-        };
+        }
+        self.mutex.unlock(self.io);
 
-        self.status = .STOPPED;
+        if (self.monitor_future) |*fut| {
+            fut.await(self.io);
+            self.monitor_future = null;
+        }
 
-        return term;
+        if (self.stderr_future) |*fut| {
+            fut.await(self.io);
+            self.stderr_future = null;
+        }
     }
 
     pub fn getPid(self: *@This()) ?process.Child.Id {
@@ -187,6 +291,7 @@ pub const Phantom = struct {
 
 const testing = std.testing;
 
+
 test "phantom: init" {
     const allocator = testing.allocator;
     const io = testing.io;
@@ -198,9 +303,10 @@ test "phantom: init" {
     defer allocator.free(dest_path);
 
     var phantom = try Phantom.init(allocator, io, "./test/template.db", dest_path);
-    defer phantom.deinit(io);
+    defer phantom.deinit();
 
-    var data_file = try tmp_dir.dir.openFile(io, phantom.data_path, .{});
+    const cwd = Dir.cwd();
+    var data_file = try cwd.openFile(io, phantom.data_path, .{});
     defer data_file.close(io);
 }
 
@@ -215,9 +321,12 @@ test "phantom: spawn" {
     defer allocator.free(dest_path);
 
     var phantom = try Phantom.init(allocator, io, "./test/template.db", dest_path);
-    defer phantom.deinit(io);
+    defer phantom.deinit();
 
-    _ = try phantom.spawnProcess(io);
+    _ = try phantom.spawnProcess();
+    try phantom.waitUntilReady();
+
+    try phantom.killProcess(.TERM);
 }
 
 // test "fuzz example" {
