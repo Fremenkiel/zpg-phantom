@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const fmt = std.fmt;
 
 const phantom = @import("phantom");
 const Phantom = phantom.Phantom;

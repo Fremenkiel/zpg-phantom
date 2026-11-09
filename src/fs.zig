@@ -19,7 +19,10 @@ pub const TmpDir = struct {
     }
 };
 
-pub fn tmpDir(io: Io, parent_path: []const u8) !TmpDir {
+pub const TmpDirError = Dir.CreateDirPathOpenError
+ || Dir.OpenError;
+
+pub fn tmpDir(io: Io, parent_path: []const u8) TmpDirError!TmpDir {
     var random_bytes: [TmpDir.random_bytes_count]u8 = undefined;
     io.random(&random_bytes);
     var sub_path: [TmpDir.sub_path_len]u8 = undefined;

@@ -8,12 +8,19 @@ const c = std.c;
 const Io = std.Io;
 const Dir = Io.Dir;
 const File = Io.File;
+const Atomic = File.Atomic;
 const posix = std.posix;
 const Threaded = Io.Threaded;
 const assert = std.debug.assert;
 
 const linux = @import("linux.zig");
 const darwin = @import("darwin.zig");
+
+pub const CopyOnWriteError = error{
+SourceFileUnavaliable,
+PermissionNotSet,
+Unimplemented
+} || Io.UnexpectedError || Dir.CreateFileAtomicError || Dir.PathNameError || Atomic.ReplaceError || Atomic.LinkError;
 
 // todo: error handling (Kevin)
 pub fn copyOnWrite(
@@ -23,13 +30,13 @@ dest_dir: Dir,
 dest_path: []const u8,
 io: Io,
 options: Dir.CopyFileOptions,
-) !void { // Dir.CopyFileError!
-    const file = try source_dir.openFile(io, source_path, .{});
+) CopyOnWriteError!void {
+    const file = source_dir.openFile(io, source_path, .{ .mode = .read_only }) catch return CopyOnWriteError.SourceFileUnavaliable;
     defer file.close(io);
 
     if (is_linux) {
         const permissions = options.permissions orelse blk: {
-            const st = try file.stat(io);
+            const st = file.stat(io) catch return CopyOnWriteError.PermissionNotSet;
             break :blk st.permissions;
         };
 
@@ -50,8 +57,6 @@ options: Dir.CopyFileOptions,
 
                 return;
             },
-            .INTR => return error.UnexpectedIntr,
-            .NODEV => return error.UnexpectedNodev,
             else => |err| return std.posix.unexpectedErrno(err),
         }
     }
@@ -65,24 +70,11 @@ options: Dir.CopyFileOptions,
             .SUCCESS => {
                 return;
             },
-            .INTR => {
-                return;
-            },
-            .OPNOTSUPP => {
-                return; // fallback
-            },
-            else => |e| {
-                assert(error.Unexpected == switch (e) {
-                    .NOMEM => return error.SystemResources,
-                    .INVAL => |err| Threaded.errnoBug(err),
-                    else => |err| posix.unexpectedErrno(err),
-                });
-                return;
-            },
+            else => |err| return posix.unexpectedErrno(err),
         }
     }
 
-    return error.Unimplemented;
+    return CopyOnWriteError.Unimplemented;
 }
 
 const FileStat = struct {
@@ -91,14 +83,18 @@ const FileStat = struct {
     shared: bool,
 };
 
-fn getFileStat(
+const FileStatError = error{
+SourceFileUnavaliable,
+InvalidFiemap,
+Unimplemented
+} || Io.UnexpectedError;
+
+fn fileStat(
 dir: Dir,
 path: []const u8,
 io: Io,
-) !FileStat {
-    const file = try dir.openFile(io, path, .{
-        .mode = .read_only,
-    });
+) FileStatError!FileStat {
+    const file = dir.openFile(io, path, .{ .mode = .read_only, }) catch return FileStatError.SourceFileUnavaliable;
     defer file.close(io);
 
     if (is_linux) {
@@ -106,7 +102,7 @@ io: Io,
         switch (posix.errno(posix.system.ioctl(file.handle, linux.FS_IOC_FIEMAP, @intFromPtr(&request)))) {
             .SUCCESS => {
                 if (request.fm_mapped_extents == 0) {
-                    return error.InvalidMap;
+                    return error.InvalidFiemap;
                 }
 
                 const extent = request.fm_extents[0];
@@ -117,8 +113,6 @@ io: Io,
                     .shared = (extent.fe_flags & linux.FIEMAP_EXTENT_SHARED) != 0,
                 };
             },
-            .INTR => return error.UnexpectedIntr,
-            .NODEV => return error.UnexpectedNodev,
             else => |err| return std.posix.unexpectedErrno(err),
         }
     }
@@ -132,26 +126,20 @@ io: Io,
         };
 
         var buf: darwin.CloneAttrBuf = undefined;
-        const rc = darwin.fgetattrlist(
-        file.handle,
-        &attr_list,
-        &buf,
-        @sizeOf(darwin.CloneAttrBuf),
-        darwin.FSOPT_ATTR_CMN_EXTENDED,
-    );
 
-        if (rc != 0) {
-            return std.posix.unexpectedErrno(std.posix.errno(rc));
+        switch (posix.errno(darwin.fgetattrlist(file.handle, &attr_list, &buf, @sizeOf(darwin.CloneAttrBuf), darwin.FSOPT_ATTR_CMN_EXTENDED))) {
+            .SUCCESS => {
+                return .{
+                    .size = @as(u64, @bitCast(buf.private_size)),
+                    .physical = buf.clone_id,
+                    .shared = (buf.ext_flags & darwin.EF_SHARES_ALL_BLOCKS) != 0,
+                };
+            },
+            else => |err| return std.posix.unexpectedErrno(err),
         }
-
-        return .{
-            .size = @as(u64, @bitCast(buf.private_size)),
-            .physical = buf.clone_id,
-            .shared = (buf.ext_flags & darwin.EF_SHARES_ALL_BLOCKS) != 0,
-        };
     }
 
-    return error.Unimplemented;
+    return FileStatError.Unimplemented;
 }
 
 const testing = std.testing;
@@ -165,7 +153,7 @@ test "reflink: copy on write" {
     const src_path = "src.bin";
     const dest_path = "cow.bin";
 
-    {
+{
         const f = try dir.createFile(io, src_path, .{ .truncate = true });
         defer f.close(io);
         const data: [64 * 1024]u8 = @splat('A');
@@ -188,12 +176,12 @@ test "reflink: copy on write" {
     });
     defer dir.deleteFile(io, dest_path) catch {};
 
-    const src_info = try getFileStat(dir, src_path, io);
-    const cow_info = try getFileStat(dir, dest_path, io);
+    const src_info = try fileStat(dir, src_path, io);
+    const cow_info = try fileStat(dir, dest_path, io);
 
     if (is_linux) {
-    try testing.expectEqual(@as(u64, 64 * 1024), cow_info.size);
-    try testing.expect(src_info.physical != 0);
+        try testing.expectEqual(@as(u64, 64 * 1024), cow_info.size);
+        try testing.expect(src_info.physical != 0);
     }
 
     if (is_darwin) {

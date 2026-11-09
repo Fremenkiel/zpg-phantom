@@ -45,6 +45,8 @@ PostgresAbnormalTermination
 pub const WaitUntilReadyError = CheckHealthError || Io.Cancelable;
 
 pub const SpawnError = error{
+ProcessAlreadyExist,
+UnexpectedStatus,
 UnexpectedError,
 } || process.SpawnError || Io.ConcurrentError || WaitUntilReadyError;
 
@@ -65,7 +67,7 @@ pub const Phantom = struct {
     allocator: Allocator,
     io: Io,
 
-    child: process.Child,
+    child: ?process.Child = null,
     mutex: Io.Mutex = .init,
 
     ready_event: Io.Event = .unset,
@@ -118,7 +120,6 @@ pub const Phantom = struct {
             .data_path = data_path,
             .socket_path = socket_path,
             .status = .Initialized,
-            .child = undefined,
         };
     }
 
@@ -133,18 +134,14 @@ pub const Phantom = struct {
 
     pub fn deinit(self: *@This()) void {
         if (self.status == .Running) {
-            self.kill(.KILL) catch |err| {
+            self.kill(.TERM) catch |err| {
                 // Assuming process is already killed
                 if (err == KillError.ProcessNotFound) {
                     self.status = .Stopped;
                     return;
                 }
 
-                const msg = std.fmt.allocPrint(self.allocator, "unable to kill process #{d}", .{ self.child.id.? }) catch {
-                    @panic("unable to kill process");
-                };
-
-                @panic(msg);
+                @panic("unable to kill process");
             };
         }
 
@@ -152,9 +149,20 @@ pub const Phantom = struct {
         self.allocator.free(self.socket_path);
 
         self.sub_dir.cleanup(self.io);
+
+        if (self.monitor_future) |*fut| {
+            fut.cancel(self.io);
+        }
+
+        if (self.stderr_future) |*fut| {
+            fut.cancel(self.io);
+        }
     }
 
     pub fn spawn(self: *@This()) SpawnError!void {
+        if (self.child != null) return SpawnError.ProcessAlreadyExist;
+        if (self.status == .Running) return SpawnError.UnexpectedStatus;
+
         const argv = &[_][]const u8{ "postgres", "-D", self.data_path, "-k", "./sock", "-c", "listen_addresses=", };
 
         self.child = try process.spawn(self.io, .{
@@ -176,8 +184,10 @@ pub const Phantom = struct {
     }
 
     fn drainStderr(self: *@This()) void {
+        if (self.child == null) return;
+
         var buffer: [1024]u8 = undefined;
-        var reader = self.child.stderr.?.reader(self.io, &buffer);
+        var reader = self.child.?.stderr.?.reader(self.io, &buffer);
         var r = &reader.interface;
 
         while (true) {
@@ -191,7 +201,12 @@ pub const Phantom = struct {
 
             const line = maybe_line orelse break;
 
-            std.log.debug("[pg] {s}", .{line});
+            // ensure fatal entries are logged to the user
+            if (std.mem.indexOf(u8, line, "FATAL") != null) {
+                std.log.err("[pg] {s}", .{line});
+            } else {
+                std.log.debug("[pg] {s}", .{line});
+            }
 
             if (!self.ready_event.isSet()) {
                 if (std.mem.indexOf(u8, line, pg_ready_str) != null) {
@@ -202,7 +217,8 @@ pub const Phantom = struct {
     }
 
     fn monitorLoop(self: *@This()) void {
-        const term_or_err = self.child.wait(self.io);
+        if (self.child == null) return;
+        const term_or_err = self.child.?.wait(self.io);
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -250,20 +266,21 @@ pub const Phantom = struct {
     }
 
     pub fn kill(self: *@This(), sig: posix.SIG) KillError!void {
-        self.mutex.lockUncancelable(self.io);
+        if (self.child == null) return KillError.ProcessNotRunning;
+        if (self.child.?.id == null) return KillError.ProcessNotRunning;
 
-        if (self.child.id == null) {
-            return KillError.ProcessNotRunning;
-        }
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
-        if (self.status == .Running)  {
-            posix.kill(self.child.id.?, sig) catch |err| return switch (err) {
-                posix.KillError.PermissionDenied => KillError.PermissionDenied,
-                posix.KillError.ProcessNotFound => KillError.ProcessNotFound,
-                else => KillError.UnexpectedError,
-            };
+            if (self.status == .Running)  {
+                posix.kill(self.child.?.id.?, sig) catch |err| return switch (err) {
+                    posix.KillError.PermissionDenied => KillError.PermissionDenied,
+                    posix.KillError.ProcessNotFound => KillError.ProcessNotFound,
+                    else => KillError.UnexpectedError,
+                };
+            }
         }
-        self.mutex.unlock(self.io);
 
         if (self.monitor_future) |*fut| {
             fut.await(self.io);
@@ -274,12 +291,13 @@ pub const Phantom = struct {
             fut.await(self.io);
             self.stderr_future = null;
         }
+
+        self.child = null;
     }
 
 };
 
 const testing = std.testing;
-
 
 test "phantom: init" {
     const allocator = testing.allocator;
@@ -313,8 +331,125 @@ test "phantom: spawn" {
     defer phantom.deinit();
 
     try phantom.spawn();
+}
 
-    try phantom.kill(.TERM);
+test "phantom: spawn and kill" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    const tmp_dir = testing.tmpDir(.{});
+
+    const dest_path = try fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    defer allocator.free(dest_path);
+
+    var phantom = try Phantom.init(allocator, io, "./test/template.db", dest_path);
+    defer phantom.deinit();
+
+    try phantom.spawn();
+
+    const socket_path = try Dir.cwd().realPathFileAlloc(io, phantom.socket_path, allocator);
+    defer allocator.free(socket_path);
+
+    try createTable(allocator, io, socket_path);
+
+    for (0..99) |_| {
+        try phantom.kill(.TERM);
+        try phantom.spawn();
+
+        try insertRow(allocator, io, socket_path);
+    }
+
+    const count = try selectCount(allocator, io, socket_path);
+    defer allocator.free(count);
+
+    try testing.expectEqualSlices(u8, "99\n", count);
+}
+
+test "phantom: spawn multiple processes" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const dest_path = try fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    defer allocator.free(dest_path);
+
+    var phantom = try Phantom.init(allocator, io, "./test/template.db", dest_path);
+    defer phantom.deinit();
+
+    try phantom.spawn();
+
+    const err = phantom.spawn();
+    try testing.expectError(SpawnError.ProcessAlreadyExist, err);
+}
+
+fn createTable(allocator: Allocator, io: Io, socket: []const u8) !void {
+    var pg_argv = [_][]const u8{
+        "psql",
+        "-h", socket,
+        "-U", "postgres",
+        "-q", "-t", "-A",
+        "-c", "CREATE TABLE users(id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name VARCHAR(255) NOT NULL);",
+    };
+    const pg_result = try std.process.run(allocator, io, .{ 
+        .argv = &pg_argv,
+    });
+    defer {
+        allocator.free(pg_result.stdout);
+        allocator.free(pg_result.stderr);
+    }
+
+    if (pg_result.term != .exited or pg_result.term.exited != 0 or pg_result.stderr.len > 0) {
+        std.debug.print("Error: PSQL create failed: {s}\n", .{pg_result.stderr});
+        return error.PsqlExecutionFailed;
+    }
+}
+
+fn insertRow(allocator: Allocator, io: Io, socket: []const u8) !void {
+    var pg_argv = [_][]const u8{
+        "psql",
+        "-h", socket,
+        "-U", "postgres",
+        "-q", "-t", "-A",
+        "-c", "INSERT INTO users (name) VALUES ('kevin');",
+    };
+    const pg_result = try std.process.run(allocator, io, .{ 
+        .argv = &pg_argv,
+    });
+    defer {
+        allocator.free(pg_result.stdout);
+        allocator.free(pg_result.stderr);
+    }
+
+    if (pg_result.term != .exited or pg_result.term.exited != 0 or pg_result.stderr.len > 0) {
+        std.debug.print("Error: PSQL create failed: {s}\n", .{pg_result.stderr});
+        return error.PsqlExecutionFailed;
+    }
+}
+
+fn selectCount(allocator: Allocator, io: Io, socket: []const u8) ![]u8 {
+    var pg_argv = [_][]const u8{ 
+        "psql",
+        "-h", socket,
+        "-U", "postgres",
+        "-q", "-t", "-A", // Formatting
+        "-c", "SELECT COUNT(id) FROM users;",
+    };
+    const pg_result = try std.process.run(allocator, io, .{ 
+        .argv = &pg_argv,
+    });
+    defer {
+        allocator.free(pg_result.stdout);
+        allocator.free(pg_result.stderr);
+    }
+
+    if (pg_result.term != .exited or pg_result.term.exited != 0 or pg_result.stderr.len > 0) {
+        std.debug.print("Error: unable to select pg data: {s}\n", .{pg_result.stderr});
+        return error.PgSelectError;
+    }
+
+    return try allocator.dupe(u8, pg_result.stdout);
 }
 
 // test "fuzz example" {
