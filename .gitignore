@@ -6,3 +6,4 @@ zig-pkg/
 test/template.db
 
 **/.DS_Store
+deps
