@@ -7,7 +7,7 @@ const phantom = @import("phantom");
 const Phantom = phantom.Phantom;
 
 pub fn run(allocator: Allocator, io: Io) !void {
-    var database = try Phantom.init(allocator, io, "./test/template.db", "/tmp");
+    var database = try Phantom.init(allocator, io, "./test/template.db", "/tmp", .{});
     defer database.deinit();
 
     {

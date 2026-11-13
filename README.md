@@ -8,7 +8,7 @@ The lib allows you to test dropouts, by killing the database process and startin
 # Usage
 ```zig
 // creates a temp folder inside the dest dir, and creates a reflink copy of the source file
-var database = try Phantom.init(allocator, io, "./test/template.db", "/tmp");
+var database = try Phantom.init(allocator, io, "./test/template.db", "/tmp", .{});
 // kills process if running and removes temp folder
 defer database.deinit();
 
