@@ -150,7 +150,7 @@ pub const Phantom = struct {
         self.allocator.free(self.data_path);
         self.allocator.free(self.socket_path);
 
-        // self.sub_dir.cleanup(self.io);
+        self.sub_dir.cleanup(self.io);
 
         if (self.monitor_future) |*fut| {
             fut.cancel(self.io);
