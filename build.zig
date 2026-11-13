@@ -37,4 +37,23 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_example_tests.step);
+
+    const debug_exe = b.addExecutable(.{
+        .name = "debug ergo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("debug.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    debug_exe.root_module.addImport("phantom", mod);
+
+    b.installArtifact(debug_exe);
+
+    const debug_step = b.step("debug", "Run the app in debug mode");
+    const debug_cmd = b.addRunArtifact(debug_exe);
+    debug_step.dependOn(&debug_cmd.step);
+    debug_cmd.step.dependOn(b.getInstallStep());
+
+    debug_cmd.addPassthruArgs();
 }

@@ -33,5 +33,10 @@ try database.spawn();
 /opt/homebrew/opt/postgresql@18/bin/initdb -D test/template.db -U postgres --auth=trust --no-sync -E UTF8 --locale=C
 ```
 
+# Nice to know
+The postgres logged message parser assumes a standard log prefix '%m \[%p\] '
+
+https://www.postgresql.org/docs/current/runtime-config-logging.html
+
 # Deps
 https://github.com/postgres/postgres.git

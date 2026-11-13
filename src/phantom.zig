@@ -6,6 +6,7 @@ const is_linux = native_os == .linux;
 const std = @import("std");
 const Io = std.Io;
 const Dir = Io.Dir;
+const Reader = Io.Reader;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const fmt = std.fmt;
@@ -62,6 +63,7 @@ const random_bytes_count = 12;
 const sub_path_len = std.base64.url_safe.Encoder.calcSize(random_bytes_count);
 
 const pg_ready_str = "database system is ready to accept connections";
+const log_fmt = "[pg] {s} {s} [{s}]: {s}\n";
 
 pub const Phantom = struct {
     allocator: Allocator,
@@ -148,7 +150,7 @@ pub const Phantom = struct {
         self.allocator.free(self.data_path);
         self.allocator.free(self.socket_path);
 
-        self.sub_dir.cleanup(self.io);
+        // self.sub_dir.cleanup(self.io);
 
         if (self.monitor_future) |*fut| {
             fut.cancel(self.io);
@@ -202,10 +204,15 @@ pub const Phantom = struct {
             const line = maybe_line orelse break;
 
             // ensure fatal entries are logged to the user
-            if (std.mem.indexOf(u8, line, "FATAL") != null) {
-                std.log.err("[pg] {s}", .{line});
-            } else {
-                std.log.debug("[pg] {s}", .{line});
+            const msg = parseLoggedMessage(line) catch break;
+
+            const log_args = .{ msg.timestamp, msg.timezone, msg.pid, msg.message };
+
+            switch (msg.severity) {
+                .debug => std.log.debug(log_fmt, log_args),
+                .info => std.log.info(log_fmt, log_args),
+                .warn => std.log.warn(log_fmt, log_args),
+                .err => std.log.err(log_fmt, log_args),
             }
 
             if (!self.ready_event.isSet()) {
@@ -296,6 +303,77 @@ pub const Phantom = struct {
     }
 
 };
+
+const LogMessage = struct {
+    timestamp: []const u8,
+    timezone: []const u8,
+    pid: []const u8,
+    severity: std.log.Level,
+    message: []const u8
+};
+
+const ParseLoggedMessageError = error{
+InvalidSeverity,
+} || Reader.DelimiterError;
+
+// assuming standard logging prefix ('%m [%p] ').
+// 2026-11-13 04:07:13.091 UTC [31011] FATAL:  empty password returned by client
+fn parseLoggedMessage(line: []const u8) ParseLoggedMessageError!LogMessage {
+    assert(line.len > 0);
+
+    var reader = Io.Reader.fixed(line);
+    const timestamp = try reader.take(23);
+
+    // discard space
+    _ = try reader.take(1);
+
+    const timezone = try reader.takeDelimiterExclusive(' ');
+
+    // discard space and left bracket
+    _ = try reader.take(2);
+
+    const pid = try reader.takeDelimiterExclusive(']');
+
+    // discard right bracket and space
+    _ = try reader.take(2);
+
+    const severity = try reader.takeDelimiterExclusive(':');
+    assert(severity.len > 0);
+
+    // discard colon 
+    _ = try reader.take(1);
+
+    while (true) {
+        const char = try reader.peekByte();
+        switch (char) {
+            '\t', ' ' => {},
+            else => break,
+        }
+
+        _ = try reader.takeByte();
+    }
+
+    const remaining = reader.end - reader.seek;
+
+    assert(remaining > 0);
+
+    const msg = try reader.take(remaining);
+
+    return LogMessage{
+        .timestamp = timestamp,
+        .timezone = timezone,
+        .pid = pid,
+        .severity = switch (severity[0]) {
+            'D' => .debug,
+            'I', 'L' => .info,
+            'W', 'N' => .warn,
+            'E', 'F' => .err,
+            'P' => @panic(msg),
+            else => return ParseLoggedMessageError.InvalidSeverity,
+        },
+        .message = msg,
+    };
+}
 
 const testing = std.testing;
 
@@ -452,33 +530,136 @@ fn selectCount(allocator: Allocator, io: Io, socket: []const u8) ![]u8 {
     return try allocator.dupe(u8, pg_result.stdout);
 }
 
-// test "fuzz example" {
-//     try std.testing.fuzz({}, testOne, .{});
-// }
-//
-// fn testOne(context: void, smith: *std.testing.Smith) !void {
-//     _ = context;
-//     // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-//
-//     const gpa = std.testing.allocator;
-//     var list: std.ArrayList(u8) = .empty;
-//     defer list.deinit(gpa);
-//     while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-//         .add_data => {
-//             const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-//             smith.bytes(slice);
-//         },
-//         .dup_data => {
-//             if (list.items.len == 0) continue;
-//             if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-//             const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-//             const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-//             try list.appendSlice(gpa, list.items[off..][0..len]);
-//             try std.testing.expectEqualSlices(
-//                 u8,
-//                 list.items[off..][0..len],
-//                 list.items[list.items.len - len ..],
-//             );
-//         },
-//     };
-// }
+test "phantom: parse logged message" {
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] DEBUG1:  test message";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.debug, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "test message", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] DEBUG2:  test message";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.debug, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "test message", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] DEBUG3:  test message";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.debug, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "test message", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] DEBUG4:  test message";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.debug, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "test message", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] DEBUG5:  test message";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.debug, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "test message", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] INFO:  test message";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.info, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "test message", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] NOTICE:  test message";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.warn, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "test message", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] WARNING:  test message";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.warn, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "test message", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 UTC [35362] ERROR:  everything went wrong, run!";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.err, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "UTC", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "everything went wrong, run!", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] LOG:  test message";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.info, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "test message", msg.message);
+    }
+
+    {
+        const line = "2026-11-13 06:26:57.867 EET [35362] FATAL:  empty password returned by client";
+
+        const msg = try parseLoggedMessage(line);
+
+        try testing.expectEqual(.err, msg.severity);
+        try testing.expectEqualSlices(u8, "2026-11-13 06:26:57.867", msg.timestamp);
+        try testing.expectEqualSlices(u8, "EET", msg.timezone);
+        try testing.expectEqualSlices(u8, "35362", msg.pid);
+        try testing.expectEqualSlices(u8, "empty password returned by client", msg.message);
+    }
+}
