@@ -75,7 +75,7 @@ const random_bytes_count = 12;
 const sub_path_len = std.base64.url_safe.Encoder.calcSize(random_bytes_count);
 
 const pg_ready_str = "database system is ready to accept connections";
-const log_fmt = "[pg] {s} {s} [{s}]: {s}\n";
+const log_fmt = "[pg] {s} {s} [{s}]: {s}";
 
 pub const PhantomOptions = struct { 
     log_level: LogLevel = .{},
