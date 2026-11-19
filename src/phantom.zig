@@ -29,6 +29,24 @@ SockCreateError,
 UnexpectedError
 } || Allocator.Error;
 
+pub const SpawnError = error{
+ProcessAlreadyExist,
+UnexpectedStatus,
+UnexpectedError,
+} || process.SpawnError || Io.ConcurrentError || WaitUntilReadyError;
+
+pub const WaitUntilReadyError = error{
+ReadinessTimeout,
+} || CheckHealthError || Io.Cancelable;
+
+pub const CheckHealthError = error{
+PostgresExitedUnexpectedly,
+PostgresCrashed,
+PostgresAbnormalTermination,
+ProcessNotRunning,
+ProcessNotReady
+} || process.Child.WaitError;
+
 pub const KillError = error{
 ProcessNotFound,
 ProcessNotRunning,
@@ -37,20 +55,6 @@ AccessDenied,
 Canceled,
 UnexpectedError,
 };
-
-pub const CheckHealthError = error{
-PostgresExitedUnexpectedly,
-PostgresCrashed,
-PostgresAbnormalTermination
-} || process.Child.WaitError;
-
-pub const WaitUntilReadyError = CheckHealthError || Io.Cancelable;
-
-pub const SpawnError = error{
-ProcessAlreadyExist,
-UnexpectedStatus,
-UnexpectedError,
-} || process.SpawnError || Io.ConcurrentError || WaitUntilReadyError;
 
 const Status = enum(u8) {
     Initialized,
@@ -73,6 +77,7 @@ const LogLevel = struct {
 
 const random_bytes_count = 12;
 const sub_path_len = std.base64.url_safe.Encoder.calcSize(random_bytes_count);
+const ready_timeout_ms = 1_000;
 
 const pg_ready_str = "database system is ready to accept connections";
 const log_fmt = "[pg] {s} {s} [{s}]: {s}";
@@ -170,14 +175,6 @@ pub const Phantom = struct {
         self.allocator.free(self.socket_path);
 
         self.sub_dir.cleanup(self.io);
-
-        if (self.monitor_future) |*fut| {
-            fut.cancel(self.io);
-        }
-
-        if (self.stderr_future) |*fut| {
-            fut.cancel(self.io);
-        }
     }
 
     pub fn spawn(self: *@This()) SpawnError!void {
@@ -188,12 +185,13 @@ pub const Phantom = struct {
 
         self.child = try process.spawn(self.io, .{
             .argv = argv,
-            .stdout = .inherit,
+            .stdout = .ignore,
             .stderr = .pipe,
         });
 
         self.status = .Running;
-        self.exited_event = .unset;
+        self.term_result = null;
+        self.wait_err = null;
 
         self.ready_event.reset();
         self.exited_event.reset();
@@ -262,13 +260,40 @@ pub const Phantom = struct {
     }
 
     fn waitUntilReady(self: *@This()) WaitUntilReadyError!void {
-        try self.ready_event.wait(self.io);
+        if (self.child == null) return WaitUntilReadyError.ProcessNotRunning;
+
+        const Result = union(enum) {
+            ready: Io.Cancelable!void,
+            timeout: Io.Cancelable!void,
+        };
+
+        var results: [2]Result = undefined;
+        var select = Io.Select(Result).init(self.io, &results);
+
+        defer select.cancelDiscard();
+
+        select.async(.ready, Io.Event.wait, .{ &self.ready_event, self.io });
+        select.async(.timeout, Io.sleep, .{ self.io, Io.Duration.fromMilliseconds(ready_timeout_ms), .awake });
+
+        const result = try select.await();
+
+        switch (result) {
+            .ready => |read_result| {
+                try read_result;
+            },
+            .timeout => |sleep_result| {
+                try sleep_result;
+                return WaitUntilReadyError.ReadinessTimeout;
+            },
+        }
 
         try self.checkHealth();
     }
 
     pub fn checkHealth(self: *@This()) CheckHealthError!void {
-        if (!self.exited_event.isSet()) return;
+        if (self.child == null) return CheckHealthError.ProcessNotRunning;
+
+        if (!self.ready_event.isSet()) return CheckHealthError.ProcessNotReady;
 
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
